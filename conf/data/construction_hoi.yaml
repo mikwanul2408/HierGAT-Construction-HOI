@@ -1,0 +1,24 @@
+# Root directory containing the datasets, relative to the project root.
+# Dataset directories are discovered recursively: any directory containing a
+# `features/` subdirectory is treated as a dataset, and datasets may be grouped
+# in intermediate subdirectories, e.g.
+# data/id/J1_2026_full_temporal_3s/features. There is no need to list them
+# explicitly.
+data_dir: data
+
+defaults:
+  - _self_
+
+name: mphoi # Dummy data name
+path: ${oc.env:PWD}/data/MPHOI/MPHOI/mphoi_ground_truth_labels.json
+path_zarr: >-
+  ${oc.env:PWD}/data/MPHOI/MPHOI/mphoi_derived_features/faster_rcnn.zarr
+path_obb_zarr: >-
+  ${oc.env:PWD}/data/MPHOI/MPHOI/mphoi_derived_features/object_bounding_boxes.zarr
+path_hbb_zarr: >-
+  ${oc.env:PWD}/data/MPHOI/MPHOI/mphoi_derived_features/human_bounding_boxes.zarr
+path_hps_zarr: >-
+  ${oc.env:PWD}/data/MPHOI/MPHOI/mphoi_derived_features/human_pose.zarr
+cross_validation_test_subject: Subject14 # Subject45, #Subject25, Subject14
+scaling_strategy: null  # null or standard
+downsampling: 1 # custom, original: 3, 1 = full FPS, 2 = half FPS, ...

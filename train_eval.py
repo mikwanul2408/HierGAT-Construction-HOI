@@ -1,0 +1,819 @@
+import os
+import random
+import json
+import gc
+from datetime import datetime
+from pathlib import Path
+
+import hydra
+import numpy as np
+import torch
+from omegaconf import DictConfig
+
+from pyrutils.torch.train_utils import train, save_checkpoint
+from pyrutils.torch.multi_task import MultiTaskLossLearner
+from vhoi.data_loading import (
+    input_size_from_data_loader,
+    select_model_data_feeder,
+    select_model_data_fetcher,
+)
+from vhoi.data_loading_construction_hoi import create_data, create_data_loader
+from vhoi.losses import (
+    select_loss,
+    decide_num_main_losses,
+    select_loss_types,
+    select_loss_learning_mask,
+)
+from vhoi.models import load_model_weights
+from vhoi.models_construction_hoi import TGGCN
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix
+
+from predict import match_shape, match_att_shape
+from constants import (
+    ACTION_CLASSES,
+    NEW_ACTION_CLASSES,
+    VIS_ACTION_CLASSES,
+)
+from utils import printh, get_dataset_dirs, get_feature_dirs_df, create_data_df
+
+torch.multiprocessing.set_sharing_strategy("file_system")  # Avoid shared memory crashes
+
+
+@hydra.main(config_path="conf", config_name="config_construction_hoi", version_base=None)
+def main(cfg: DictConfig):
+    """Train and evaluate the model with k-fold cross-validation.
+
+    The configuration is loaded by Hydra from conf/config_construction_hoi.yaml.
+    Usage examples:
+
+        python train_eval.py
+        python train_eval.py --config-name config_construction_hoi_ms0
+        python train_eval.py train.k_fold=10 train.selected_folds=[1,3]
+        python train_eval.py models.optimization.epochs=20 models.optimization.batch_size=64
+    """
+
+    dataset_dirs = get_dataset_dirs(cfg.data.data_dir)
+
+    # Read the training-run settings from the `train` section of the config.
+    seed = cfg.train.seed
+    k_fold = cfg.train.k_fold
+    selected_folds = cfg.train.get("selected_folds", None)  # List of fold numbers (1-based) to run.
+                                                                   # null = run all folds. Example: [1, 3, 5]
+    min_epochs = cfg.train.get("min_epochs", 10)            # Minimum epochs before early stopping can activate
+    early_stopping_patience = cfg.train.get("early_stopping_patience", None)  # null = disabled
+    early_stopping_metric = cfg.train.get("early_stopping_metric", "val_loss")  # 'val_loss' | 'val_f1' | 'val_accuracy' | 'val_min_per_class_f1'
+    num_workers = cfg.train.get("num_workers", 4)          # Number of data loading workers
+    num_test_videos = cfg.train.get("num_test_videos", 1)  # Number of test videos withheld per fold
+
+    # Set random seed
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    torch.set_num_threads(cfg.resources.num_threads)
+    model_name, model_input_type = (
+        cfg.models.metadata.model_name,
+        cfg.models.metadata.input_type,
+    )
+    batch_size, val_fraction = (
+        cfg.models.optimization.batch_size,
+        cfg.models.optimization.val_fraction,
+    )
+    misc_dict = cfg.get("misc", default_value={})
+    sigma = misc_dict.get("segmentation_loss", {}).get("sigma", 0.0)
+    scaling_strategy = cfg.data.scaling_strategy
+    downsampling = cfg.data.downsampling
+
+    # Determine test feature directories for k-fold
+    feature_dirs_df = get_feature_dirs_df(
+        dataset_dirs,
+        ACTION_CLASSES,
+        NEW_ACTION_CLASSES,
+    )
+    feature_dirs_df = feature_dirs_df.dropna(subset=['action_label'])
+    
+    feature_dir_counts = (
+        feature_dirs_df["base_dir"].value_counts().sort_values()
+    )  # Count occurrences of each feature directory
+    # and sort from lowest to highest
+    # kfold_test_feature_dirs = feature_dir_counts.index[:k] # OLD
+
+    # NEW - Monte Carlo mechanism: Randomly split all feature directories into
+    # k_fold disjoint groups of num_test_videos each; fold i tests group i and
+    # trains on the rest. num_test_videos = 1 reproduces leave-one-out.
+    all_feature_dirs = feature_dir_counts.index.tolist()
+    total_videos = len(all_feature_dirs)
+    required_test_videos = k_fold * num_test_videos
+    if required_test_videos > total_videos:
+        raise ValueError(
+            f"Not enough distinct videos for the requested cross-validation split: "
+            f"k_fold={k_fold} * num_test_videos={num_test_videos} = "
+            f"{required_test_videos} test video slots, but only {total_videos} "
+            f"videos are available. Reduce k_fold or num_test_videos."
+        )
+    shuffled_feature_dirs = random.sample(all_feature_dirs, total_videos)
+    kfold_test_video_groups = [  # list of lists, one per fold
+        shuffled_feature_dirs[i * num_test_videos:(i + 1) * num_test_videos]
+        for i in range(k_fold)
+    ]
+
+    # Validate and resolve selected_folds (1-based: fold numbers from 1 to k_fold)
+    if selected_folds is not None:
+        if not selected_folds:
+            raise ValueError("selected_folds must not be empty.")
+        invalid_folds = [f for f in selected_folds if f < 1 or f > k_fold]
+        if invalid_folds:
+            raise ValueError(
+                f"Invalid fold numbers {invalid_folds}. Valid range: 1 to {k_fold}."
+            )
+    else:
+        selected_folds = list(range(1, k_fold + 1))
+
+    # Create evaluation directory
+    run_name = (
+        f"hs{cfg.models.parameters.hidden_size}_"
+        f"e{cfg.models.optimization.epochs}_"
+        f"bs{cfg.models.optimization.batch_size}_"
+        f"lr{cfg.models.optimization.learning_rate}_"
+        f"k{k_fold}_"
+        f"{datetime.now().strftime('%y%m%d%H%M%S')}"
+    )
+    eval_dir = f"{os.getcwd()}/eval/{run_name}"
+    try:
+        os.makedirs(eval_dir, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(f"Failed to create eval directory '{eval_dir}': {e}") from e
+
+    # Iterate through selected folds
+    acc_list, f1_list, precision_list, recall_list, cm_list = [], [], [], [], []
+    val_acc_list, val_f1_list, val_precision_list, val_recall_list, val_cm_list = [], [], [], [], []
+    best_train_loss_list, best_val_loss_list = [], []
+    for fold_num in selected_folds:
+        fold_idx = fold_num - 1  # Convert 1-based to 0-based index
+        test_feature_dirs = kfold_test_video_groups[fold_idx]
+        printh(f"Fold {fold_num}: {test_feature_dirs}", 128)
+
+        # Create log directory
+        root_log_dir = f"{os.getcwd()}/outputs_hiergat/construction_hoi"
+        fold_str = str(fold_num).zfill(len(str(k_fold)))
+        checkpoint_name = f"{run_name}_fold{fold_str}"
+        log_dir = f"{root_log_dir}/{checkpoint_name}"
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(f"Failed to create log directory '{log_dir}': {e}") from e
+
+        print("Log directory:", log_dir)
+        print()
+
+        printh("Train-Test Splitting", 96)
+
+        # Log training and test video IDs
+        test_video_ids = [
+            Path(str(d)).parent.stem.split("_")[0] for d in test_feature_dirs
+        ]
+        test_video_id = ", ".join(test_video_ids)
+        all_video_ids = [
+            feature_dir.parent.stem.split("_")[0] for feature_dir in dataset_dirs
+        ]
+        # train_video_ids = [video_id for video_id in all_video_ids if video_id not in test_video_ids]
+        train_video_ids = [
+            video_id for video_id in all_video_ids if video_id not in set(test_video_ids)
+        ]
+
+        print("Test video IDs (unseen):", test_video_ids)
+        print("Training video IDs (seen):")
+        print(train_video_ids)
+        print()
+        print("All video IDs (unseen + seen):")
+        print(all_video_ids)
+        print()
+
+        # Split train and test feature directories
+        test_feature_dirs_df = feature_dirs_df[
+            feature_dirs_df["base_dir"].isin(test_feature_dirs)
+        ]
+        train_feature_dirs_df = feature_dirs_df[
+            ~feature_dirs_df["base_dir"].isin(test_feature_dirs)
+        ]
+
+        print("Training action label counts:")
+        print(train_feature_dirs_df["action_label"].value_counts().sort_index())
+        print()
+        print("Test action label counts:")
+        print(test_feature_dirs_df["action_label"].value_counts().sort_index())
+        print()
+
+        # Create data dataframe
+        df = create_data_df(
+            train_feature_dirs_df["dir"].tolist(),
+            ACTION_CLASSES,
+            NEW_ACTION_CLASSES if "NEW_ACTION_CLASSES" in globals() else None,
+        )
+
+        # Split train and validation feature data
+        printh("Train-Validation Splitting", 96)
+
+        for base_dir, group_df in df.groupby("base_dir"):
+            printh(f"Feature Directory: {base_dir}", 64)
+
+            # group_df['split'] = 'train' # OLD
+            df.loc[df["base_dir"] == base_dir, "split"] = "train"
+            group_df = group_df.sort_values("start_fid")
+
+            n_slices = len(group_df)
+            if n_slices >= 2:
+                try:
+                    n_val = max(
+                        1, min(int(round(n_slices * val_fraction)), n_slices - 1)
+                    )
+                except (TypeError, ValueError) as e:
+                    raise RuntimeError(
+                        f"Failed to compute validation size from n_slices={n_slices} "
+                        f"and val_fraction={val_fraction}: {e}"
+                    ) from e
+
+                # Randomly position a contiguous block of n_val slices in time order
+                val_start_idx = random.randrange(0, n_slices - n_val + 1)
+                val_indices = group_df.index[val_start_idx:val_start_idx + n_val]
+
+                print(
+                    f"Validation block: {n_val} of {n_slices} slices at time positions "
+                    f"{val_start_idx}-{val_start_idx + n_val - 1} "
+                    f"(FIDs {group_df['start_fid'].iloc[val_start_idx]:.0f}-"
+                    f"{group_df['end_fid'].iloc[val_start_idx + n_val - 1]:.0f})"
+                )
+                print()
+
+                # Slices are atomic samples; move the chosen block to validation
+                df.loc[val_indices, "split"] = "val"
+            else:
+                print(
+                    f"Only {n_slices} labeled slice(s) in this video -> keeping all as "
+                    "training (cannot temporally split)."
+                )
+                print()
+
+            base_dir_cond = df["base_dir"] == base_dir
+            train_group_df = df[base_dir_cond & (df["split"] == "train")]
+            val_group_df = df[base_dir_cond & (df["split"] == "val")]
+
+            if len(df[base_dir_cond]) != len(train_group_df) + len(val_group_df):
+                raise AssertionError(
+                    f'Invalid split sizes: train={len(train_group_df)}, val={len(val_group_df)}, '
+                    f'total={len(df[base_dir_cond])}'
+                )
+
+            print("Training action label info:")
+            print(train_group_df["action_label"].value_counts())
+            print("Total:", len(train_group_df))
+            print()
+            print("Validation action label info:")
+            print(val_group_df["action_label"].value_counts())
+            print("Total:", len(val_group_df))
+            print()
+            print("Testing action label info:")
+            print("(not applicable - the k-fold test video is evaluated at the end)")
+            print()
+
+        # Create train, validation, and test dataframes
+        train_df = df[df["split"] == "train"]
+        val_df = df[df["split"] == "val"]
+        test_df = df[df["split"] == "test"]
+
+        train_size = len(train_df)
+        val_size = len(val_df)
+        test_size = len(test_df)
+        all_size = len(df)
+
+        print(f"Total train data: {train_size} ({train_size / all_size * 100:.2f}%)")
+        print(f"Total val data: {val_size} ({val_size / all_size * 100:.2f}%)")
+        print(f"Total test data: {test_size} ({test_size / all_size * 100:.2f}%)")
+        print()
+
+        data_cols = [
+            "human_features",
+            "human_boxes",
+            "human_poses",
+            "object_features",
+            "object_boxes",
+            "gt",
+            "xs_step",
+        ]
+        train_data = train_df[data_cols].to_numpy().T.tolist()
+        val_data = val_df[data_cols].to_numpy().T.tolist()
+        test_data = create_data(
+            test_feature_dirs_df["dir"].tolist(),
+            ACTION_CLASSES,
+            NEW_ACTION_CLASSES if "NEW_ACTION_CLASSES" in globals() else None,
+        )
+
+        # Guard against degenerate splits (empty train/val/test sets)
+        if len(train_data[0]) == 0:
+            raise RuntimeError(
+                "Training set is empty! Add more labeled feature slices or reduce "
+                "k_fold (the k-fold test video leaves no train data)."
+            )
+        if len(test_data[0]) == 0:
+            raise RuntimeError(
+                f"Test set is empty for fold video '{test_video_id}'! "
+                "No labeled feature slices available in its feature directory."
+            )
+        val_has_data = len(val_data[0]) > 0
+        if not val_has_data:
+            print(
+                "WARNING: Validation set is empty (no train video has >= 2 labeled slices "
+                "to hold out). Training without validation; early stopping and validation "
+                "metrics will be skipped for this fold."
+            )
+            print()
+
+        # Create data loaders
+        train_loader, scalers, _ = create_data_loader(
+            train_data[0],
+            train_data[1],
+            train_data[2],
+            train_data[3],
+            train_data[4],
+            train_data[5],
+            train_data[6],
+            model_name,
+            batch_size=batch_size,
+            shuffle=True,
+            scaling_strategy=scaling_strategy,
+            sigma=sigma,
+            downsampling=downsampling,
+            num_workers=num_workers,
+        )
+        val_loader = None
+        if val_has_data:
+            val_loader, _, _ = create_data_loader(
+                val_data[0],
+                val_data[1],
+                val_data[2],
+                val_data[3],
+                val_data[4],
+                val_data[5],
+                val_data[6],
+                model_name,
+                batch_size=len(val_data[0]),
+                shuffle=False,
+                scalers=scalers,
+                sigma=sigma,
+                downsampling=downsampling,
+                num_workers=num_workers,
+            )
+        else:
+            print("Skipping validation DataLoader creation (empty validation set).")
+        test_loader, _, _ = create_data_loader(
+            *test_data,
+            model_name,
+            batch_size=len(test_data[0]),
+            shuffle=False,
+            scalers=scalers,
+            sigma=sigma,
+            downsampling=downsampling,
+            num_workers=num_workers,
+        )
+        input_size = input_size_from_data_loader(
+            train_loader, model_name, model_input_type
+        )
+        data_info = {"input_size": input_size}
+
+        # Create model
+        model_creation_args = cfg.models.parameters
+        model_creation_args = {**data_info, **model_creation_args}
+        dataset_name = cfg.data.name
+        num_classes = len(NEW_ACTION_CLASSES)
+        model_creation_args["num_classes"] = (num_classes, None)
+        device = (
+            "cuda" if torch.cuda.is_available() and cfg.resources.use_gpu else "cpu"
+        )
+        model = TGGCN(feat_dim=1024, **model_creation_args).to(device)
+        if (
+            misc_dict.get("pretrained", False)
+            and misc_dict.get("pretrained_path") is not None
+        ):
+            state_dict = load_model_weights(misc_dict["pretrained_path"])
+            model.load_state_dict(state_dict, strict=False)
+        params = model.parameters()
+        optimizer = torch.optim.Adam(params, lr=cfg.models.optimization.learning_rate)
+        criterion, loss_names = select_loss(
+            model_name, model_input_type, dataset_name, cfg=cfg
+        )
+        mtll_model = None
+        if misc_dict.get("multi_task_loss_learner", False):
+            loss_types = select_loss_types(model_name, dataset_name, cfg=cfg)
+            mask = select_loss_learning_mask(model_name, dataset_name, cfg=cfg)
+            mtll_model = MultiTaskLossLearner(loss_types=loss_types, mask=mask).to(
+                device
+            )
+            optimizer.add_param_group({"params": mtll_model.parameters()})
+        # Some config + model training
+        tensorboard_log_dir = root_log_dir  # OLD: cfg.models.logging.root_log_dir
+        # checkpoint_name = cfg.models.logging.checkpoint_name
+        fetch_model_data = select_model_data_fetcher(
+            model_name,
+            model_input_type,
+            dataset_name=dataset_name,
+            **{**misc_dict, **cfg.models.parameters.__dict__},
+        )
+        feed_model_data = select_model_data_feeder(
+            model_name, model_input_type, dataset_name=dataset_name, **misc_dict
+        )
+        num_main_losses = decide_num_main_losses(
+            model_name, dataset_name, {**misc_dict, **cfg.models.parameters.__dict__}
+        )
+
+        # Training
+        printh("Training", 96)
+
+        checkpoint = train(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            cfg.models.optimization.epochs,
+            device,
+            loss_names,
+            clip_gradient_at=cfg.models.optimization.clip_gradient_at,
+            fetch_model_data=fetch_model_data,
+            feed_model_data=feed_model_data,
+            val_loader=val_loader,
+            mtll_model=mtll_model,
+            num_main_losses=num_main_losses,
+            tensorboard_log_dir=tensorboard_log_dir,
+            checkpoint_name=checkpoint_name,
+            early_stopping_patience=early_stopping_patience,
+            min_epochs=min_epochs,
+            early_stopping_metric=early_stopping_metric,
+        )
+
+        print()
+
+        # Logging
+        # if cfg.models.logging.log_dir is not None: # OLD
+        if log_dir is not None:
+            # log_dir = cfg.models.logging.log_dir
+            checkpoint["scalers"] = scalers
+            save_checkpoint(
+                log_dir,
+                checkpoint,
+                checkpoint_name=checkpoint_name,
+                include_timestamp=False,
+            )
+
+        # Load the BEST model weights from checkpoint (selected by the early stopping
+        # metric: val_loss by default, or val_f1/val_accuracy/val_min_per_class_f1 if
+        # configured via train.early_stopping_metric).
+        # The train() function saves the best model in checkpoint['model_state_dict']
+        best_epoch = checkpoint.get('epoch', 0)
+        print(f"\nLoading best model from epoch {best_epoch}...")
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Extract best epoch losses from checkpoint
+        best_epoch_idx = best_epoch - 1  # 0-indexed
+        if checkpoint['train_losses'] and best_epoch_idx < len(checkpoint['train_losses']):
+            best_train_loss = checkpoint['train_losses'][best_epoch_idx][0]
+        else:
+            best_train_loss = checkpoint['train_losses'][-1][0]
+        if checkpoint.get('val_losses'):
+            if best_epoch_idx < len(checkpoint['val_losses']):
+                best_val_loss = checkpoint['val_losses'][best_epoch_idx][0]
+            else:
+                best_val_loss = checkpoint['val_losses'][-1][0]
+        else:
+            best_val_loss = float('nan')  # no validation data for this fold
+        best_train_loss_list.append(best_train_loss)
+        best_val_loss_list.append(best_val_loss)
+        print(f"Best epoch train loss: {best_train_loss:.4f}")
+        print(f"Best epoch val loss:   {best_val_loss:.4f}")
+        if early_stopping_metric != "val_loss" and checkpoint.get("best_metric_value") is not None:
+            best_metric_value = checkpoint["best_metric_value"]
+            if np.isfinite(best_metric_value):
+                print(f"Best epoch {early_stopping_metric}: {best_metric_value:.4f}")
+
+        model.eval()
+        inspect_model = False
+
+        if val_loader is not None:
+            # Validation Evaluation
+            printh("Validation Evaluation", 96)
+            print("Test video ID:", test_video_id)
+            print()
+
+            val_outputs, val_targets, val_attentions = [], [], []
+
+            for i, dataset in enumerate(val_loader):
+                data, target = fetch_model_data(dataset, device=device)
+                with torch.no_grad():
+                    output = feed_model_data(model, data)
+                attention_scores = []
+                if inspect_model:
+                    output, attention_scores = output
+                    attention_scores = [att_score[:, 0] for att_score in attention_scores]
+                if num_main_losses is not None:
+                    output = output[-num_main_losses:]
+                    target = target[-num_main_losses:]
+                if downsampling > 1:
+                    for i, (out, tgt) in enumerate(zip(output, target, strict=True)):
+                        if out.ndim != 4:
+                            raise RuntimeError(
+                                f"Number of dimensions for output is {out.ndim}"
+                            )
+                        out = torch.repeat_interleave(out, repeats=downsampling, dim=-2)
+                        out = match_shape(out, tgt)
+                        output[i] = out
+                    if inspect_model:
+                        a_target = target[0]
+                        attention_scores = [
+                            torch.repeat_interleave(att_score, repeats=downsampling, dim=-2)
+                            for att_score in attention_scores
+                        ]
+                        attention_scores = [
+                            match_att_shape(att_score, a_target)
+                            for att_score in attention_scores
+                        ]
+                        val_attentions.append(attention_scores)
+                val_outputs += output
+                val_targets += target
+
+            val_y_pred = torch.argmax(val_outputs[0], dim=1).cpu().numpy()
+            val_y_true = val_targets[0].squeeze(-1).mode(dim=1).values.cpu().numpy()
+
+            val_acc = accuracy_score(val_y_true, val_y_pred)
+            val_f1 = f1_score(val_y_true, val_y_pred, average="weighted", zero_division=0)
+            val_precision = precision_score(val_y_true, val_y_pred, average="weighted", zero_division=0)
+            val_recall = recall_score(val_y_true, val_y_pred, average="weighted", zero_division=0)
+
+            print("Validation Accuracy:", val_acc)
+            print("Validation F1 score:", val_f1)
+            print("Validation Precision:", val_precision)
+            print("Validation Recall:", val_recall)
+
+            # Plot confusion matrix
+            ticklabels = NEW_ACTION_CLASSES
+
+            val_cm = confusion_matrix(val_y_true, val_y_pred, labels=list(range(len(ticklabels))))
+
+            print("Validation Confusion matrix:")
+            print(val_cm)
+            print()
+
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(
+                val_cm,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                xticklabels=VIS_ACTION_CLASSES,
+                yticklabels=VIS_ACTION_CLASSES,
+            )
+            plt.xlabel("Prediction")
+            plt.ylabel("Ground Truth")
+            plt.title("Validation Confusion Matrix")
+
+            # Save confusion matrix
+            val_cm_dir = f"{eval_dir}/val_cm"
+            try:
+                os.makedirs(val_cm_dir, exist_ok=True)
+            except OSError as e:
+                raise RuntimeError(f"Failed to create val_cm directory '{val_cm_dir}': {e}") from e
+            plt.savefig(f"{val_cm_dir}/fold{fold_str}.png")
+            plt.close()
+
+            # Store validation metrics
+            val_acc_list.append(val_acc)
+            val_f1_list.append(val_f1)
+            val_precision_list.append(val_precision)
+            val_recall_list.append(val_recall)
+            val_cm_list.append(val_cm)
+
+            del val_outputs, val_targets
+            torch.cuda.empty_cache()
+        else:
+            # No validation data: keep per-fold metric lists aligned (NaN / empty CM sentinels)
+            val_acc_list.append(float('nan'))
+            val_f1_list.append(float('nan'))
+            val_precision_list.append(float('nan'))
+            val_recall_list.append(float('nan'))
+            val_cm_list.append(np.zeros((len(VIS_ACTION_CLASSES), len(VIS_ACTION_CLASSES)), dtype=int))
+            print('Skipping validation evaluation (empty validation set).')
+            print()
+
+        # Test Evaluation
+        printh("Test Evaluation", 96)
+        print("Test video ID:", test_video_id)
+        print()
+
+        outputs, targets, attentions = [], [], []
+
+        for i, dataset in enumerate(test_loader):
+            data, target = fetch_model_data(dataset, device=device)
+            with torch.no_grad():
+                output = feed_model_data(model, data)
+            attention_scores = []
+            if inspect_model:
+                output, attention_scores = output
+                attention_scores = [att_score[:, 0] for att_score in attention_scores]
+            if num_main_losses is not None:
+                output = output[-num_main_losses:]
+                target = target[-num_main_losses:]
+            if downsampling > 1:
+                for i, (out, tgt) in enumerate(zip(output, target, strict=True)):
+                    if out.ndim != 4:
+                        raise RuntimeError(
+                            f"Number of dimensions for output is {out.ndim}"
+                        )
+                    out = torch.repeat_interleave(out, repeats=downsampling, dim=-2)
+                    out = match_shape(out, tgt)
+                    output[i] = out
+                if inspect_model:
+                    a_target = target[0]
+                    attention_scores = [
+                        torch.repeat_interleave(att_score, repeats=downsampling, dim=-2)
+                        for att_score in attention_scores
+                    ]
+                    attention_scores = [
+                        match_att_shape(att_score, a_target)
+                        for att_score in attention_scores
+                    ]
+                    attentions.append(attention_scores)
+            outputs += output
+            targets += target
+
+        y_pred = torch.argmax(outputs[0], dim=1).cpu().numpy()
+        y_true = targets[0].squeeze(-1).mode(dim=1).values.cpu().numpy()
+
+        acc = accuracy_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        precision = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+        recall = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+
+        print("Test Accuracy:", acc)
+        print("Test F1 score:", f1)
+        print("Test Precision:", precision)
+        print("Test Recall:", recall)
+
+        # Plot confusion matrix
+        ticklabels = NEW_ACTION_CLASSES
+
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(len(ticklabels))))
+
+        print("Test Confusion matrix:")
+        print(cm)
+        print()
+
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            xticklabels=VIS_ACTION_CLASSES,
+            yticklabels=VIS_ACTION_CLASSES,
+        )
+        plt.xlabel("Prediction")
+        plt.ylabel("Ground Truth")
+        plt.title("Test Confusion Matrix")
+
+        # Save confusion matrix
+        cm_dir = f"{eval_dir}/cm"
+        try:
+            os.makedirs(cm_dir, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(f"Failed to create cm directory '{cm_dir}': {e}") from e
+        plt.savefig(f"{cm_dir}/fold{fold_str}.png")
+        plt.close()
+
+        # Cleanup (VERY IMPORTANT)
+        del model, optimizer
+        del train_loader, val_loader, test_loader
+        del train_data, val_data, test_data
+        del df, train_df, val_df, test_df
+        del outputs, targets
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Store test metrics
+        acc_list.append(acc)
+        f1_list.append(f1)
+        precision_list.append(precision)
+        recall_list.append(recall)
+        cm_list.append(cm)
+
+    # Compute mean and std for all folds
+    acc_mean, acc_std = np.mean(acc_list), np.std(acc_list)
+    f1_mean, f1_std = np.mean(f1_list), np.std(f1_list)
+    precision_mean, precision_std = np.mean(precision_list), np.std(precision_list)
+    recall_mean, recall_std = np.mean(recall_list), np.std(recall_list)
+
+    val_acc_mean, val_acc_std = np.mean(val_acc_list), np.std(val_acc_list)
+    val_f1_mean, val_f1_std = np.mean(val_f1_list), np.std(val_f1_list)
+    val_precision_mean, val_precision_std = np.mean(val_precision_list), np.std(val_precision_list)
+    val_recall_mean, val_recall_std = np.mean(val_recall_list), np.std(val_recall_list)
+
+    best_train_loss_mean, best_train_loss_std = np.mean(best_train_loss_list), np.std(best_train_loss_list)
+    best_val_loss_mean, best_val_loss_std = np.mean(best_val_loss_list), np.std(best_val_loss_list)
+
+    print("\n" + "=" * 64)
+    print("Training All-Fold Results Summary")
+    print("=" * 64)
+    print(f"Loss:      {best_train_loss_mean:.4f} ± {best_train_loss_std:.4f}")
+    print("=" * 64)
+
+    print("\n" + "=" * 64)
+    print("Validation All-Fold Results Summary")
+    print("=" * 64)
+    print(f"Loss:      {best_val_loss_mean:.4f} ± {best_val_loss_std:.4f}")
+    print(f"Accuracy:  {val_acc_mean:.4f} ± {val_acc_std:.4f}")
+    print(f"F1 Score:  {val_f1_mean:.4f} ± {val_f1_std:.4f}")
+    print(f"Precision: {val_precision_mean:.4f} ± {val_precision_std:.4f}")
+    print(f"Recall:    {val_recall_mean:.4f} ± {val_recall_std:.4f}")
+    print("=" * 64)
+
+    print("\n" + "=" * 64)
+    print("Test All-Fold Results Summary")
+    print("=" * 64)
+    print(f"Accuracy:  {acc_mean:.4f} ± {acc_std:.4f}")
+    print(f"F1 Score:  {f1_mean:.4f} ± {f1_std:.4f}")
+    print(f"Precision: {precision_mean:.4f} ± {precision_std:.4f}")
+    print(f"Recall:    {recall_mean:.4f} ± {recall_std:.4f}")
+    print("=" * 64 + "\n")
+
+    # Convert numpy arrays to lists for JSON serialization
+    cm_list_serializable = [cm.tolist() for cm in cm_list]
+    val_cm_list_serializable = [cm.tolist() for cm in val_cm_list]
+
+    # Save metrics
+    metrics = {
+        "val": {
+            "acc": {
+                "folds": val_acc_list,
+                "mean": val_acc_mean,
+                "std": val_acc_std,
+            },
+            "f1": {
+                "folds": val_f1_list,
+                "mean": val_f1_mean,
+                "std": val_f1_std,
+            },
+            "precision": {
+                "folds": val_precision_list,
+                "mean": val_precision_mean,
+                "std": val_precision_std,
+            },
+            "recall": {
+                "folds": val_recall_list,
+                "mean": val_recall_mean,
+                "std": val_recall_std,
+            },
+            "cm": {
+                "folds": val_cm_list_serializable,
+            },
+        },
+        "test": {
+            "acc": {
+                "folds": acc_list,
+                "mean": acc_mean,
+                "std": acc_std,
+            },
+            "f1": {
+                "folds": f1_list,
+                "mean": f1_mean,
+                "std": f1_std,
+            },
+            "precision": {
+                "folds": precision_list,
+                "mean": precision_mean,
+                "std": precision_std,
+            },
+            "recall": {
+                "folds": recall_list,
+                "mean": recall_mean,
+                "std": recall_std,
+            },
+            "cm": {
+                "folds": cm_list_serializable,
+            },
+        },
+    }
+
+    try:
+        with open(f"{eval_dir}/metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=4)
+    except OSError as e:
+        raise RuntimeError(f"Failed to save metrics to '{eval_dir}/metrics.json': {e}") from e
+
+
+if __name__ == "__main__":
+    main()  # type: ignore[call-arg]
